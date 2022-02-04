@@ -1,0 +1,151 @@
+pool:
+  vmImage: 'ubuntu-18.04'
+  name: Azure Pipelines
+
+variables:
+- group: AWS_ECR
+- name: app_version
+  value: '1.0'
+
+stages:
+- stage: build_publish_stage
+  displayName: 'Build & Publish Stage'
+  variables:
+    MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2/repository
+    MAVEN_OPTS: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+    
+  jobs:
+  - job: Build_Publish_MVN_docker
+    displayName: 'Build and Publish for MVN and Docker' 
+    steps:
+    - script: |
+        aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com
+        repo=$(aws ecr describe-repositories --region $(AWS_REGION) | jq '.repositories[].repositoryName' | sed s/\"//g | grep -w '$(Build.Repository.Name)')
+        echo "print repos: $repo"
+        if [ -z $repo ]; then
+         echo "create repo $(Build.Repository.Name)"
+         aws ecr create-repository --repository-name  $(Build.Repository.Name) --region $(AWS_REGION)
+        fi
+      displayName: 'Login to AWS'
+      env:
+         AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+         AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+    - script: |
+       sed -i -e s/DEPLOYMENT_DIRECTORY_PATH/$(echo ${DEPLOYMENT_DIRECTORY} | sed 's_/_\\/_g')/g new_dg_deployment/run_application.sh
+       sed -i -e s/DEPLOYMENT_DIRECTORY_PATH/$(echo ${DEPLOYMENT_DIRECTORY} | sed 's_/_\\/_g')/g new_dg_deployment/before_install.sh
+       sed -i -e s/replace_db_connection_password/${REPLACE_DB_CONNECTION_PASSWORD}/g src/main/resources/application.properties
+       sed -i -e s/replace_db_connection_url/$(echo ${REPLACE_DB_CONNECTION_URL} | sed 's_/_\\/_g')/g src/main/resources/application.properties
+       sed -i -e s/replace_db_connection_username/${REPLACE_DB_CONNECTION_USERNAME}/g src/main/resources/application.properties
+       sed -i -e s/replace_docker_registry/$(echo ${REPLACE_DOCKER_REGISTRY} | sed 's_/_\\/_g')/g new_dg_deployment/docker-compose-dg.yml
+       sed -i -e s/replace_docker_repo/$(echo ${REPLACE_DOCKER_REPO} | sed 's_/_\\/_g')/g new_dg_deployment/docker-compose-dg.yml
+       sed -i -e s/replace_docker_version/$(Build.SourceBranchName)-$(app_version).$(Build.BuildId)/g new_dg_deployment/docker-compose-dg.yml
+       sed -i -e s/replace_branch_name/$(Build.SourceBranchName)/g pom.xml
+       sed -i -e s/replace_app_version/$(app_version).$(Build.BuildId)/g pom.xml
+       sed -i -e s/replace_branch_name/$(Build.SourceBranchName)/g Dockerfile
+       sed -i -e s/replace_app_version/$(app_version).$(Build.BuildId)/g Dockerfile
+      displayName: 'Setup for Build'
+
+    - task: Cache@2
+      inputs:
+        key: 'maven | "$(Agent.OS)" | pom.xml'
+        restoreKeys: |
+          maven | "$(Agent.OS)"
+          maven
+        path: $(MAVEN_CACHE_FOLDER)
+      displayName: Cache Maven local repo   
+
+    - task: ArchiveFiles@2
+      inputs:
+        rootFolderOrFile: '$(Build.SourcesDirectory)/new_dg_deployment'
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/new_dg_deployment-$(Build.SourceBranchName)-$(app_version).$(Build.BuildId).zip'
+        replaceExistingArchive: false
+
+    - task: SonarQubePrepare@4
+      inputs:
+        SonarQube: 'azure-devops-sonar'
+        scannerMode: 'Other'
+        extraProperties: |
+          # Additional properties that will be passed to the scanner, 
+          # Put one key=value per line, example:
+          # sonar.exclusions=**/*.bin
+          sonar.projectName=azure-new-sonata-dg
+          sonar.projectKey=azure-ner-sonata-dg
+    
+    - task: Maven@3
+      inputs:
+        mavenPomFile: 'pom.xml'
+        options: '-Dmaven.test.skip=true'
+        publishJUnitResults: false
+        javaHomeOption: 'JDKVersion'
+        mavenOptions: '-Xmx1024m $(MAVEN_OPTS)'
+        mavenVersionOption: 'Default'
+        mavenAuthenticateFeed: false
+        effectivePomSkip: false
+        sonarQubeRunAnalysis: true
+        sqMavenPluginVersionChoice: 'latest' 
+  
+    # - script: |
+    #     mvn clean package || exit 0
+    #   displayName: 'Mvn Build'
+    
+    - task: SonarQubePublish@4
+      inputs:
+        pollingTimeoutSec: '300' 
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/new_dg_deployment-$(Build.SourceBranchName)-$(app_version).$(Build.BuildId).zip'
+        ArtifactName: 'DG Deployment'
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Pipeline Artifact'
+      inputs:
+        targetPath: '$(Build.SourcesDirectory)/target/DG-Service-$(Build.SourceBranchName)-$(app_version).$(Build.BuildId).jar'
+        artifact: 'DG_Jar_Artifact'
+
+    - task: Docker@2
+      inputs:
+        repository: '$(Build.Repository.Name)'
+        command: 'build'
+        Dockerfile: 'Dockerfile'
+        tags: 'latest'
+
+    - task: ECRPushImage@1
+      inputs:
+        awsCredentials: 'aws_ecr_registry'
+        regionName: '$(AWS_REGION)'
+        imageSource: 'imagename'
+        sourceImageName: '$(Build.Repository.Name)'
+        repositoryName: '$(Build.Repository.Name)'
+        pushTag: '$(Build.SourceBranchName).$(Build.BuildId)' 
+- stage: deploy_to_ecs
+  displayName: 'Deploy To ECS'
+  jobs:
+  - deployment: deploysonatadg
+    displayName:  "Deployment for sonatadg"
+    environment: '$(Build.Repository.Name)-$(ENVIRONMENT)'
+    strategy:
+      runOnce:
+       deploy:
+        steps:
+        - checkout: none
+        - task: AWSShellScript@1
+          inputs:
+            awsCredentials: 'aws_ecr_registry'
+            regionName: '$(AWS_REGION)'
+            scriptType: 'inline'
+            inlineScript: | 
+                TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition '$(ECS_TASK_DEF_NAME)')
+              
+                NEW_TASK_DEFINTIION=$(echo $TASK_DEFINITION | jq --arg IMAGE "$(DOCKER_REPO_NAME):$(Build.SourceBranchName)-$(app_version).$(Build.BuildId)" '.taskDefinition | .containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.requiresAttributes) | del(.compatibilities) | del(.registeredAt) | del(.registeredBy)')
+
+                NEW_TASK_INFO=$(aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEFINTIION")
+
+                NEW_REVISION=$(echo $NEW_TASK_INFO | jq '.taskDefinition.revision')
+
+                aws ecs update-service --cluster $(ECS_CLUSTER_NAME) \
+                          --service $(Build.Repository.Name) \
+                          --task-definition $(Build.Repository.Name):${NEW_REVISION}
+            displayName: 'Deploy to ECS'
