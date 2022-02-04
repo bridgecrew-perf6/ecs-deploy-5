@@ -1,0 +1,17 @@
+#!/bin/bash
+lb=$1
+#classic_lb
+Instancer_id=$(aws elb describe-load-balancers --load-balancer-name $lb --query LoadBalancerDescriptions[*].Instances | sed 's/[{}]//g' | sed 's/[][]//g'  | sed 's/"//g' | cut -d ':' -f2 | sed 's/,//g')
+#ALB
+#Instancer_id=$(aws elbv2 describe-target-health --target-group-arn arn:aws:elasticloadbalancing:eu-central-1:885577414843:targetgroup/ppdseucelb1/72af89ae01483d40 --query 'TargetHealthDescriptions[*].Target.Id' --region eu-central-1 | sed 's/[{}]//g' | sed 's/[][]//g'  | sed 's/"//g' | cut -d ':' -f2 | sed 's/,//g' | sed 's/^ *//g')
+echo "id : $Instance_id"
+for id in $Instance_id
+do 
+   echo "instance_id: $id"
+   ip=$(aws ec2 describe-instances --instance-id $id | jq ".Reservations[0].Instances[0].NetworkInterfaces[0].PrivateIpAddress" | sed 's/"//g')
+   echo $ip-address
+   echo "deregistrer the instance from loadbalancer: $lb"
+   aws elb deregister-instances-from-load-balancer --load-balancer-name $lb --instances $id
+   echo "reregister to the loadbalancer: $lb"
+   aws elb register-instances-with-load-balancer --load-balancer-name $lb --instances $id
+done
